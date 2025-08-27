@@ -29,7 +29,6 @@ The goal of the project was to use real student academic, behavioral, and socio-
 
 ## 📂 Files
 - `ML_Graduation_Prediction_Code_XGBoost_Logistic.Rmd` – Main R Markdown script with preprocessing, feature engineering, modeling, and evaluation  
-- (Optional) `Final_Report.pdf` – Written report summarizing methods and results  
 
 ---
 
