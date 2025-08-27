@@ -1,0 +1,274 @@
+---
+title: "XG Boost + Logisitc Regression v2"
+author: "Group 1"
+date: "2025-04-17"
+output:
+  word_document: default
+  html_document: default
+---
+
+
+```{r setup, include=FALSE}
+set.seed(22)
+library(tidyverse)
+library(janitor)
+library(dplyr)
+library(tidyr)
+library(tidymodels)
+library(yardstick)
+library(caret)
+library(themis)
+library(glmnet)
+library(broom)
+library(purrr)
+```
+
+```{r get the data, include=FALSE}
+source("Millard_preprocess.R")
+data_raw <- read.csv("MillardProjectData.csv")
+data_raw <- data_raw
+millard_data <- prepare_millard(data_raw) 
+```
+
+```{r model, echo=FALSE}
+
+
+# Step 1: Prepare Data
+millard_data <- millard_data %>%
+  mutate(Graduated = factor(Graduated, levels = c("No", "Yes"))) 
+
+data_split <- initial_split(millard_data, prop = 0.8, strata = Graduated)
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+# Step 2: XGBoost Recipe (Stage 1)
+model_recipe <- recipe(Graduated ~ ., data = data_train) %>%
+  update_role(Student_ID, new_role = "ID") %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_upsample(Graduated)
+
+# Step 3: XGBoost Model
+class_counts <- table(data_train$Graduated)
+weight_ratio <- as.numeric(class_counts["Yes"] / class_counts["No"])
+
+xgb_model <- boost_tree(
+  trees = 500,
+  mtry = tune(),
+  tree_depth = tune(),
+  learn_rate = 0.1
+) %>%
+  set_engine("xgboost", scale_pos_weight = weight_ratio) %>%
+  set_mode("classification")
+
+xgb_workflow <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(xgb_model)
+
+cv_folds <- vfold_cv(data_train, v = 5, strata = Graduated)
+
+classification_metrics <- metric_set(
+  yardstick::accuracy,
+  yardstick::kap,
+  yardstick::roc_auc,
+  yardstick::mn_log_loss,
+  yardstick::sens,
+  yardstick::spec,
+  yardstick::f_meas,
+  yardstick::precision,
+  yardstick::recall,
+  yardstick::pr_auc
+)
+
+xgb_grid <- grid_random(
+  mtry(range = c(2, 15)),
+  tree_depth(range = c(2, 10)),
+  size = 30
+)
+
+xgb_results <- tune_grid(
+  xgb_workflow,
+  resamples = cv_folds,
+  grid = xgb_grid,
+  metrics = classification_metrics,
+  control = control_resamples(save_workflow = TRUE, save_pred = TRUE, event_level = "second")
+)
+
+best_xgb <- xgb_results %>% select_best(metric = "roc_auc")
+final_xgb <- finalize_workflow(xgb_workflow, best_xgb)
+
+# Step 4: Predict on Test Set (Stage 1)
+risk_by_missingness <- data_test %>%
+  mutate(
+    missing_semesters = rowSums(is.na(select(., `9_S1`, `9_S2`,`10_S1`, `10_S2`,`11_S1`, `11_S2`,`12_S1`, `12_S2`))),
+    pre_flag_high_risk = if_else(missing_semesters >= 4, "AtRisk", NA_character_)
+  ) %>%
+  select(Student_ID, pre_flag_high_risk)
+
+xgb_test_preds <- final_xgb %>% fit(data = data_train) %>%
+  augment(new_data = data_test)
+
+xgb_test_preds <- xgb_test_preds %>%
+  left_join(risk_by_missingness, by = "Student_ID") %>%
+  mutate(stage1_flag = case_when(
+    pre_flag_high_risk == "AtRisk" ~ "AtRisk",
+    .pred_Yes < 0.75 ~ "AtRisk",
+    TRUE ~ "Safe"
+  ))
+
+# Step 5: Prepare At-Risk Subset for Stage 2
+at_risk_data <- xgb_test_preds %>%
+  filter(stage1_flag == "AtRisk") %>%
+  left_join(data_test %>% select(-Graduated), by = "Student_ID") %>%
+  select(-matches("\\.y$")) %>%
+  rename_with(~ gsub("\\.x$", "", .x)) %>%
+  mutate(Graduated = factor(Graduated, levels = c("No", "Yes")))
+```
+
+```{r}
+# Step 6: Penalized Logistic Regression Model (Stage 2 with LASSO)
+stage2_recipe <- recipe(Graduated ~ Student_ID + NumberFours + GPA_Change + Program.A + Guid.Mental + PREACT_SCORE + UnexcusedAbs, data = at_risk_data) %>%
+  update_role(Student_ID, new_role = "ID") %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.9)
+
+stage2_model <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+stage2_wf <- workflow() %>%
+  add_recipe(stage2_recipe) %>%
+  add_model(stage2_model)
+
+boot_folds <- bootstraps(at_risk_data, times = 50, strata = Graduated)
+
+boot_folds_balanced <- boot_folds %>%
+  mutate(class_check = map(splits, ~ {
+    data <- analysis(.x)
+    all(c("No", "Yes") %in% unique(data$Graduated))
+  })) %>%
+  filter(class_check == TRUE) %>%
+  select(-class_check)
+
+tuned_lasso <- tune_grid(
+  stage2_wf,
+  resamples = boot_folds_balanced,
+  grid = tibble(penalty = 10^seq(-4, -1, length.out = 20)),
+  metrics = metric_set(roc_auc),
+   control = control_grid(save_pred = TRUE))
+
+best_lasso <- select_best(tuned_lasso, metric = "roc_auc")
+final_lasso <- finalize_workflow(stage2_wf, best_lasso) %>%
+  fit(data = at_risk_data)
+
+### Step 7: Predict Stage 2 ###
+stage2_preds <- final_lasso %>%
+  predict(new_data = at_risk_data, type = "prob") %>%
+  bind_cols(at_risk_data %>% select(Student_ID, Graduated)) %>%
+  mutate(stage2_final = factor(if_else(.pred_Yes >= 0.8, "Yes", "No"),
+                               levels = c("No", "Yes")))
+
+### Step 8: Final Decision Combining Both Stages ###
+final_preds <- xgb_test_preds %>%
+  select(Student_ID, Graduated, .pred_Yes) %>%
+  left_join(stage2_preds %>% select(Student_ID, stage2_final), by = "Student_ID") %>%
+  mutate(final_class = case_when(
+    stage2_final == "No" & !is.na(stage2_final) ~ "No",
+    TRUE ~ "Yes"
+  )) %>%
+  mutate(final_class = factor(final_class, levels = c("No", "Yes")),
+         Graduated = factor(Graduated, levels = c("No", "Yes")))
+
+### Step 9: Evaluate Final Model ###
+# Metrics
+classification_metrics(
+  data = final_preds,
+  truth = Graduated,
+  estimate = final_class,
+  .pred_Yes,
+  event_level = "second"
+)
+
+# Confusion Matrix
+confusionMatrix(data = final_preds$final_class,
+                reference = final_preds$Graduated,
+                positive = "Yes")
+
+# ROC Curve
+roc_curve(data = final_preds,
+          truth = Graduated,
+          .pred_Yes,
+          event_level = "second") %>%
+  autoplot()
+```
+```{r prediciting on the unseen test data}
+     
+
+# Load and prepare the new test data
+test_data <- read.csv("MillardProjectData_Test.csv")
+millard_data_test <- prepare_millard(test_data)
+
+# Predict graduation probability with XGBoost model
+xgb_test_augmented <- final_xgb %>%
+  fit(data = data_train) %>%
+  augment(new_data = millard_data_test)
+
+# Identify missingness-based high risk
+risk_by_missingness_new <- millard_data_test %>%
+  mutate(
+    missing_semesters = rowSums(is.na(select(., `9_S1`, `9_S2`,`10_S1`, `10_S2`,`11_S1`, `11_S2`,`12_S1`, `12_S2`))),
+    pre_flag_high_risk = if_else(missing_semesters >= 4, "AtRisk", NA_character_)
+  ) %>%
+  select(Student_ID, pre_flag_high_risk)
+
+# Apply risk classification threshold
+xgb_test_augmented <- xgb_test_augmented %>%
+  left_join(risk_by_missingness_new, by = "Student_ID") %>%
+  mutate(stage1_flag = case_when(
+    pre_flag_high_risk == "AtRisk" ~ "AtRisk",
+    .pred_Yes < 0.75 ~ "AtRisk",
+    TRUE ~ "Safe"
+  ))
+
+# Prepare AtRisk subset for Stage 2
+at_risk_new <- xgb_test_augmented %>%
+  filter(stage1_flag == "AtRisk") %>%
+  left_join(millard_data_test, by = "Student_ID") %>%
+  select(-matches("\\.y$")) %>%
+  rename_with(~ gsub("\\.x$", "", .x))
+
+# Predict on AtRisk subset using logistic regression model
+stage2_probs_new <- final_lasso %>%
+  predict(new_data = at_risk_new, type = "prob") %>%
+  bind_cols(at_risk_new %>% select(Student_ID)) %>%
+  mutate(stage2_class = if_else(.pred_Yes >= 0.5, "Yes", "No"))
+
+# Combine final predictions
+final_combined_preds <- xgb_test_augmented %>%
+  select(Student_ID, .pred_Yes, stage1_flag) %>%
+  left_join(stage2_probs_new %>% select(Student_ID, .pred_Yes, stage2_class), by = "Student_ID", suffix = c("_xgb", "_lasso")) %>%
+  mutate(
+    final_prediction = case_when(
+      stage1_flag == "Safe" ~ "Yes",
+      TRUE ~ stage2_class
+    ),
+    final_probability = case_when(
+      stage1_flag == "Safe" ~ .pred_Yes_xgb,
+      TRUE ~ .pred_Yes_lasso
+    )
+  ) %>%
+  select(Student_ID, stage1_flag, final_prediction, final_probability)
+
+# Ensure final_prediction is a factor
+final_combined_preds <- final_combined_preds %>%
+  mutate(final_prediction = factor(final_prediction, levels = c("No", "Yes")))
+```
